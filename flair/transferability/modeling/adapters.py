@@ -294,6 +294,57 @@ class ClipAdapter(LanguageAdapterWrapper):
         return X
 
 
+class KnowledgeConditionedResidual(torch.nn.Module):
+    """
+    Residual vision adapter conditioned on the expert-text class embeddings.
+
+    Given an image embedding x (B x D) and class text embeddings T (C x D):
+      1) knowledge summary  t_hat = softmax(tau * x T^T) T   (what the expert text says about
+         the classes this image looks like; equals zero-shot FLAIR's posterior over classes)
+      2) residual           r = MLP([x ; t_hat])
+      3) output             x' = normalize(x + ratio * r)
+    The last MLP layer is zero-initialised, so before training x' == x and the adapted model is
+    exactly zero-shot FLAIR. This is the only difference with CLIP-Adapter, whose residual is a
+    function of x alone.
+    """
+
+    def __init__(self, c_in, reduction=4, ratio=0.2):
+        super().__init__()
+        self.ratio = ratio
+        self.fc1 = torch.nn.Linear(2 * c_in, c_in // reduction, bias=False)
+        self.act = torch.nn.ReLU(inplace=True)
+        self.fc2 = torch.nn.Linear(c_in // reduction, c_in, bias=False)
+        torch.nn.init.zeros_(self.fc2.weight)
+
+    def forward(self, x, text_embeds, logit_scale):
+        # Knowledge summary from the (frozen) expert-text prototypes
+        attn = torch.softmax(logit_scale * (x @ text_embeds.t()), dim=-1)
+        t_hat = attn @ text_embeds
+        # Knowledge-conditioned residual
+        r = self.fc2(self.act(self.fc1(torch.cat([x, t_hat], dim=-1))))
+        x = x + self.ratio * r
+        return x / x.norm(dim=-1, keepdim=True)
+
+
+class KnowledgeAdapter(ClipAdapter):
+    """
+    Knowledge-conditioned adapter (project contribution). Same training recipe, hyper-parameters
+    and inference path as ClipAdapter (see ClipAdapter.train / predict); only the residual changes.
+    """
+
+    def __init__(self, model, targets, domain_knowledge=False, tta=False, fta=False):
+        super().__init__(model, targets, domain_knowledge=domain_knowledge, tta=tta, fta=fta)
+
+        # Replace CLIP-Adapter's residual MLP by the knowledge-conditioned one
+        self.adapter = KnowledgeConditionedResidual(self.c_in, reduction=self.reduction,
+                                                    ratio=self.ratio).to(device)
+
+    def residual_adapter(self, X):
+        X = X.to(torch.float32)
+        text_embeds = self.text_embeds.to(device).to(torch.float32)
+        return self.adapter(X, text_embeds, self.model.logit_scale.exp())
+
+
 class TipAdapter(LanguageAdapterWrapper):
     def __init__(self, model, targets, domain_knowledge=False, tta=False, fta=False, train=False):
         super().__init__(model, targets, domain_knowledge=domain_knowledge, tta=tta, fta=fta)

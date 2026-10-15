@@ -14,7 +14,7 @@ from flair.modeling.model import FLAIRModel
 from flair.transferability.data.dataloader import get_dataloader_splits
 from flair.utils.metrics import evaluate, average_folds_results, save_results
 from flair.modeling.misc import set_seeds
-from flair.transferability.modeling.adapters import LinearProbe, ClipAdapter, ZeroShot, TipAdapter
+from flair.transferability.modeling.adapters import LinearProbe, ClipAdapter, ZeroShot, TipAdapter, KnowledgeAdapter
 from flair.transferability.modeling.finetuning import FineTuning
 
 from local_data.constants import *
@@ -41,6 +41,10 @@ def init_adapter(model, args):
         print("Transferability by CLIP Adapter...", end="\n")
         adapter = ClipAdapter(model, args.setting["targets"], tta=args.tta, fta=args.fta,
                               domain_knowledge=args.domain_knowledge)
+    elif args.method == "kcAdapter":
+        print("Transferability by Knowledge-conditioned Adapter...", end="\n")
+        adapter = KnowledgeAdapter(model, args.setting["targets"], tta=args.tta, fta=args.fta,
+                                   domain_knowledge=args.domain_knowledge)
     elif args.method == "tipAdapter":
         print("Transferability by TIP-Adapter Adapter...", end="\n")
         adapter = TipAdapter(model, args.setting["targets"], tta=args.tta, fta=args.fta,
