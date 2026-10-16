@@ -18,6 +18,7 @@ import numpy as np
 from tqdm import tqdm
 from sklearn.linear_model import LogisticRegression
 
+from flair.modeling.dictionary import definitions
 from flair.pretraining.data.transforms import augmentations_pretraining
 
 # Device for training/inference
@@ -343,6 +344,146 @@ class KnowledgeAdapter(ClipAdapter):
         X = X.to(torch.float32)
         text_embeds = self.text_embeds.to(device).to(torch.float32)
         return self.adapter(X, text_embeds, self.model.logit_scale.exp())
+
+
+class KnowledgeCacheAdapter(LanguageAdapterWrapper):
+    """
+    Knowledge-conditioned adapter v2 (description-level expert knowledge + support cache).
+
+    FLAIR's zero-shot classifier averages the expert descriptions of a class into ONE prototype,
+    which blurs lesion-specific cues (e.g. "venous beading" vs "neovascularization"). Here each
+    class keeps its K descriptions e_ck and the image chooses how much each one matters:
+
+        z_ck(x)  = s * <x, e_ck>
+        w_ck(x)  = softmax_k( gamma * z_ck(x) + u_ck )          (gamma, u_ck learnable)
+        S_c(x)   = sum_k w_ck(x) * z_ck(x)                      (knowledge score of class c)
+        logits   = S_c(x) + alpha * Tip-cache_c(x)              (training-free cache, as Tip-Adapter)
+
+    With gamma = 0 and u = 0 the weights are uniform, so S_c(x) = s * <x, mean_k e_ck> is exactly
+    zero-shot FLAIR, and logits are exactly Tip-Adapter's: training can only move away from that.
+    Only gamma and u (1 + C*K numbers) are trained, by cross-entropy on the support set with the
+    cache switched OFF during training (a support image would otherwise match itself in the cache).
+    use_cache=False gives the text-only ablation.
+    """
+
+    def __init__(self, model, targets, domain_knowledge=False, tta=False, fta=False, use_cache=True):
+        super().__init__(model, targets, domain_knowledge=domain_knowledge, tta=tta, fta=fta)
+
+        # Same constants as TipAdapter (inference path)
+        self.scale = 100.0
+        self.beta = 5
+        self.alpha = 1
+        self.use_cache = use_cache
+        self.cache_keys = None
+        self.cache_values = None
+
+        # Per-description expert-text embeddings, padded to K: (C x K x D) + validity mask (C x K)
+        self.desc_embeds, self.desc_mask = self.compute_description_embeddings(list(targets.keys()),
+                                                                               domain_knowledge)
+        n_classes, n_desc, _ = self.desc_embeds.shape
+        self.gamma = torch.nn.Parameter(torch.zeros(1, device=device))
+        self.u = torch.nn.Parameter(torch.zeros(n_classes, n_desc, device=device))
+
+    def compute_description_embeddings(self, categories, domain_knowledge):
+        # Same description lists / prompt as FLAIRModel.compute_text_embeddings (which already ran)
+        lists = []
+        for c in categories:
+            if domain_knowledge and c in definitions:
+                descs = list(definitions[c])
+                if c not in descs and "myopic maculopathy" not in c:
+                    descs.append(c)
+            else:
+                descs = [c]
+            lists.append(descs)
+
+        k_max = max(len(d) for d in lists)
+        dim = self.text_embeds.shape[-1]
+        embeds = torch.zeros(len(lists), k_max, dim, device=device)
+        mask = torch.zeros(len(lists), k_max, dtype=torch.bool, device=device)
+        for i, descs in enumerate(lists):
+            with torch.no_grad():
+                prompts = [self.model.caption.replace("[CLS]", d) for d in descs]
+                tokens = self.model.text_model.tokenizer(prompts, truncation=True, padding=True,
+                                                         return_tensors='pt')
+                input_ids = tokens["input_ids"].to(device).to(torch.long)
+                attention_mask = tokens["attention_mask"].to(device).to(torch.long)
+                emb = self.model.text_model(input_ids, attention_mask)
+            embeds[i, :len(descs)] = emb.to(torch.float32)
+            mask[i, :len(descs)] = True
+        return embeds, mask
+
+    def zero_shot_logits(self, X):
+        return self.scale * (X @ self.text_embeds.to(device).to(torch.float32).t())
+
+    def text_logits(self, X):
+        # z: B x C x K similarities to every expert description
+        z = self.scale * torch.einsum('bd,ckd->bck', X, self.desc_embeds)
+        weights = self.gamma * z + self.u.unsqueeze(0)
+        weights = weights.masked_fill(~self.desc_mask.unsqueeze(0), float('-inf'))
+        weights = torch.softmax(weights, dim=-1)
+        return (weights * z).sum(-1)
+
+    def cache_logits(self, X):
+        affinity = X @ self.cache_keys
+        return torch.exp((-1) * (self.beta - self.beta * affinity)) @ self.cache_values
+
+    def logits(self, X):
+        out = self.text_logits(X)
+        if self.use_cache and self.cache_keys is not None:
+            out = out + self.alpha * self.cache_logits(X)
+        return out
+
+    def train(self, X, Y):
+        X = torch.tensor(X).to(torch.float32)
+        Y = torch.tensor(Y).to(torch.long)
+
+        # Training-free cache from the support set (Tip-Adapter)
+        self.cache_keys = X.t().to(device)
+        self.cache_values = torch.nn.functional.one_hot(Y, num_classes=self.num_targets).to(torch.float32).to(device)
+
+        # Learn description weighting (cache OFF so a support image cannot match itself).
+        # Learning rate chosen a priori (few scalars, few steps); NOT tuned on test data.
+        epochs, lr = 40, 0.01
+        optimizer = torch.optim.AdamW([self.gamma, self.u], lr=lr, eps=1e-4)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, epochs * X.shape[0])
+
+        for i_epoch in range(epochs):
+            loss_epoch = 0.0
+            for i_sample in np.random.permutation(X.shape[0]):
+                x_batch = X[i_sample, :].unsqueeze(0).to(device)
+                target = Y[i_sample].unsqueeze(0).to(device)
+
+                loss = torch.nn.functional.cross_entropy(self.text_logits(x_batch), target)
+
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                scheduler.step()
+
+                loss_epoch += loss.item() / X.shape[0]
+
+            print('loss=%2.5f' % loss_epoch, end="\n")
+        print('gamma=%2.4f' % self.gamma.item(), end="\n")
+
+    def predict(self, loader, transforms=None):
+
+        if self.tta:
+            scores = []
+            for i in range(self.number_augmentations):
+                X, refs = self.extract_vision_features(loader, transforms=augmentations_pretraining)
+                with torch.no_grad():
+                    score_i = self.logits(torch.tensor(X).to(device).to(torch.float32))
+                scores.append(score_i.unsqueeze(-1))
+            score = torch.concat(scores, -1).mean(-1)
+        else:
+            X, refs = self.extract_vision_features(loader)
+            with torch.no_grad():
+                score = self.logits(torch.tensor(X).to(device).to(torch.float32))
+
+        # Softmax probs from scores
+        preds = torch.softmax(score, dim=-1)
+        preds = preds.detach().cpu().numpy()
+        return refs, preds
 
 
 class TipAdapter(LanguageAdapterWrapper):

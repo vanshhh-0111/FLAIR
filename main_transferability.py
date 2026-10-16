@@ -14,7 +14,8 @@ from flair.modeling.model import FLAIRModel
 from flair.transferability.data.dataloader import get_dataloader_splits
 from flair.utils.metrics import evaluate, average_folds_results, save_results
 from flair.modeling.misc import set_seeds
-from flair.transferability.modeling.adapters import LinearProbe, ClipAdapter, ZeroShot, TipAdapter, KnowledgeAdapter
+from flair.transferability.modeling.adapters import LinearProbe, ClipAdapter, ZeroShot, TipAdapter, KnowledgeAdapter, \
+    KnowledgeCacheAdapter
 from flair.transferability.modeling.finetuning import FineTuning
 
 from local_data.constants import *
@@ -45,6 +46,11 @@ def init_adapter(model, args):
         print("Transferability by Knowledge-conditioned Adapter...", end="\n")
         adapter = KnowledgeAdapter(model, args.setting["targets"], tta=args.tta, fta=args.fta,
                                    domain_knowledge=args.domain_knowledge)
+    elif args.method in ("kcAdapter2", "kcAdapter2-nocache"):
+        print("Transferability by Knowledge-conditioned Adapter v2...", end="\n")
+        adapter = KnowledgeCacheAdapter(model, args.setting["targets"], tta=args.tta, fta=args.fta,
+                                        domain_knowledge=args.domain_knowledge,
+                                        use_cache=(args.method == "kcAdapter2"))
     elif args.method == "tipAdapter":
         print("Transferability by TIP-Adapter Adapter...", end="\n")
         adapter = TipAdapter(model, args.setting["targets"], tta=args.tta, fta=args.fta,
