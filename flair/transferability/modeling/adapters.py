@@ -11,6 +11,7 @@ Zero-shot, Linear Probe (LP), ClipAdapter, TipAdapter, TipAdapter-f
 """
 
 import copy
+import os
 import random
 import torch
 import numpy as np
@@ -479,11 +480,36 @@ class KnowledgeCacheAdapter(LanguageAdapterWrapper):
             X, refs = self.extract_vision_features(loader)
             with torch.no_grad():
                 score = self.logits(torch.tensor(X).to(device).to(torch.float32))
+                if os.environ.get("KC_DEBUG"):
+                    self.print_debug(torch.tensor(X).to(device).to(torch.float32))
 
         # Softmax probs from scores
         preds = torch.softmax(score, dim=-1)
         preds = preds.detach().cpu().numpy()
         return refs, preds
+
+    def print_debug(self, X):
+        # Diagnostic (KC_DEBUG=1): how big are the class-to-class logit gaps of each term?
+        # What matters for the argmax is the spread ACROSS classes, so we report its mean std.
+        def spread(t):
+            return t.std(dim=-1).mean().item()
+        zs = self.zero_shot_logits(X)
+        tl = self.text_logits(X)
+        cl = self.alpha * self.cache_logits(X) if self.cache_keys is not None else torch.zeros_like(tl)
+        agree_zs = (tl.argmax(-1) == zs.argmax(-1)).float().mean().item()
+        agree_total = (self.logits(X).argmax(-1) == tl.argmax(-1)).float().mean().item()
+        print("DEBUG gamma=%.4f  u(mean|u|)=%.4f  max-weight(mean)=%.3f" % (
+            self.gamma.item(), self.u.abs().mean().item(),
+            self._mean_max_weight(X)))
+        print("DEBUG class-spread: zero-shot=%.3f  learned-text=%.3f  cache=%.3f" % (spread(zs), spread(tl), spread(cl)))
+        print("DEBUG argmax agreement: learned-text vs zero-shot=%.3f  final vs learned-text=%.3f" % (agree_zs, agree_total))
+
+    def _mean_max_weight(self, X):
+        z = self.scale * torch.einsum('bd,ckd->bck', X, self.desc_embeds)
+        w = self.gamma * z + self.u.unsqueeze(0)
+        w = torch.softmax(w.masked_fill(~self.desc_mask.unsqueeze(0), float('-inf')), dim=-1)
+        multi = self.desc_mask.sum(1) > 1
+        return w.max(-1).values[:, multi].mean().item() if multi.any() else 1.0
 
 
 class TipAdapter(LanguageAdapterWrapper):
