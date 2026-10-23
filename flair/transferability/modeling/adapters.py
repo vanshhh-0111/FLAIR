@@ -512,6 +512,59 @@ class KnowledgeCacheAdapter(LanguageAdapterWrapper):
         return w.max(-1).values[:, multi].mean().item() if multi.any() else 1.0
 
 
+class KnowledgeProtoAdapter(KnowledgeCacheAdapter):
+    """
+    Knowledge-initialised prototype adapter (v3). Builds on KnowledgeCacheAdapter:
+
+        logits_c(x) = S_c(x) + <x, delta_c> + b_c + alpha * Tip-cache_c(x)
+
+    S_c(x): description-attention score over FLAIR's expert descriptions (zero-shot FLAIR when gamma=u=0).
+    delta, b: learnable prototype residual / class bias, initialised at 0 and L2-penalised (lam), so the model
+              starts at zero-shot FLAIR and can move the decision boundary (v2 could not).
+    cache:    training-free support-set cache, alpha/beta chosen on a validation split by the benchmark.
+    use_attn=False freezes the description attention (gamma=u=0); use_res=False freezes delta and b.
+    """
+
+    def __init__(self, model, targets, domain_knowledge=False, tta=False, fta=False,
+                 use_attn=True, use_res=True, lam=0.1, alpha=1.0, beta=5, steps=100, lr=0.05):
+        super().__init__(model, targets, domain_knowledge=domain_knowledge, tta=tta, fta=fta, use_cache=True)
+        self.use_attn, self.use_res = use_attn, use_res
+        self.lam, self.steps, self.lr = lam, steps, lr
+        self.alpha, self.beta = alpha, beta
+
+        n_classes, _, dim = self.desc_embeds.shape
+        self.delta = torch.nn.Parameter(torch.zeros(n_classes, dim, device=device))
+        self.bias = torch.nn.Parameter(torch.zeros(n_classes, device=device))
+
+    def text_logits(self, X):
+        return super().text_logits(X) + X @ self.delta.t() + self.bias
+
+    def train(self, X, Y):
+        X = torch.tensor(X).to(torch.float32).to(device)
+        Y = torch.tensor(Y).to(torch.long).to(device)
+
+        # Training-free cache from the support set (used only at inference)
+        self.cache_keys = X.t()
+        self.cache_values = torch.nn.functional.one_hot(Y, num_classes=self.num_targets).to(torch.float32)
+
+        params = []
+        if self.use_attn:
+            params += [self.gamma, self.u]
+        if self.use_res:
+            params += [self.delta, self.bias]
+        if len(params) == 0:
+            return
+
+        # Full-batch training on the cached support features, cache OFF (a support image would match itself).
+        # lr / steps are fixed a priori; only lam (and the cache alpha/beta) are tuned, on validation data.
+        optimizer = torch.optim.AdamW(params, lr=self.lr, weight_decay=0.0, eps=1e-4)
+        for _ in range(self.steps):
+            loss = torch.nn.functional.cross_entropy(self.text_logits(X), Y) + self.lam * (self.delta ** 2).sum()
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+
 class TipAdapter(LanguageAdapterWrapper):
     def __init__(self, model, targets, domain_knowledge=False, tta=False, fta=False, train=False):
         super().__init__(model, targets, domain_knowledge=domain_knowledge, tta=tta, fta=fta)
