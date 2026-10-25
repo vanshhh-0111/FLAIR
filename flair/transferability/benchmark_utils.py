@@ -14,7 +14,8 @@ from sklearn.metrics import cohen_kappa_score
 # Hyper-parameter grids (tuned on the validation split only)
 ALPHAS = [0, 1, 5, 10, 20, 50, 100, 200]      # weight of the Tip-style cache term (0 = no cache)
 BETAS = [1, 3, 5, 10]                          # sharpness of the Tip-style cache affinity
-LAMBDAS = [1e-3, 1e-2, 1e-1, 1.0]              # L2 penalty on the prototype residual (ours)
+LAMBDAS = [1e-3, 1e-2, 1e-1, 1.0]              # L2 penalty on the prototype residual (ours v1)
+LAMBDAS_HEAD = [10.0, 1.0, 0.1, 0.01]          # L2 anchor of the text-anchored head (ours2); strongest first
 
 
 def make_split(labels, seed, test_frac=0.5, val_frac=0.1):
@@ -72,3 +73,29 @@ def tuning_score(refs, preds):
     """Validation criterion used to pick hyper-parameters: mean of ACA and quadratic kappa."""
     m = quick_metrics(refs, preds)
     return 0.5 * (m["aca"] + m["kappa"])
+
+
+def support_folds(labels, max_folds=3):
+    """
+    Stratified folds over the k-shot support set, for hyper-parameter selection by cross-validation.
+    Returns [(train_idx, holdout_idx), ...]; [] when no class has >= 2 support images (e.g. k = 1).
+    A class with a single image always stays in training; every training part keeps >= 1 image of every
+    class that has >= 2 images.
+    """
+    labels = np.asarray(labels)
+    counts = [int((labels == c).sum()) for c in np.unique(labels)]
+    n_folds = int(min(max_folds, max(counts)))
+    if n_folds < 2:
+        return []
+    fold_of = -np.ones(len(labels), dtype=int)
+    for c in np.unique(labels):
+        idx = np.where(labels == c)[0]
+        if len(idx) >= 2:
+            for j, i in enumerate(idx):
+                fold_of[i] = j % n_folds
+    folds = []
+    for f in range(n_folds):
+        hold = np.where(fold_of == f)[0]
+        if len(hold):
+            folds.append((np.where(fold_of != f)[0], hold))
+    return folds

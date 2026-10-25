@@ -22,16 +22,21 @@ PRETTY = {"zero_shot": "Zero-shot FLAIR", "zero_shot_noknow": "Zero-shot (class 
           "tipAdapter-tuned": "Tip-Adapter (val-tuned)", "tipAdapter-f": "Tip-Adapter-F (repo defaults)",
           "tipAdapter-f-tuned": "Tip-Adapter-F (val-tuned alpha)", "ours": "Ours",
           "ours-nocache": "Ours w/o cache", "ours-noattn": "Ours w/o description attention",
-          "ours-nores": "Ours w/o prototype residual", "ours-noknow": "Ours w/o expert text (class names)"}
+          "ours-nores": "Ours w/o prototype residual", "ours-noknow": "Ours w/o expert text (class names)",
+          "tipAdapter-tuned-cv": "Tip-Adapter (CV-tuned)", "ours2": "Ours v2",
+          "ours2-nocv": "Ours v2, val-only tuning", "ours2-nohead": "Ours v2 w/o head",
+          "ours2-nocache": "Ours v2 w/o cache", "ours2-noknow": "Ours v2 w/o expert text"}
 DATASET_NAMES = {"02_MESSIDOR": "MESSIDOR (5-grade DR)", "13_FIVES": "FIVES (4-class)",
                  "25_REFUGE": "REFUGE (glaucoma)", "05_20x3": "20x3 (normal / RP / MH; tiny)"}
 METRIC_NAMES = {"kappa": "Quadratic kappa", "aca": "Average class accuracy (ACA)", "f1": "Macro F1", "auc": "Macro AUC"}
 PLOT_METHODS = ["ours", "clipAdapter", "tipAdapter-tuned", "tipAdapter-f-tuned"]
 PLOT_COLORS = {"ours": "#2a78d6", "clipAdapter": "#eb6834", "tipAdapter-tuned": "#1baf7a",
-               "tipAdapter-f-tuned": "#eda100"}
-PAIRED_AGAINST = ["zero_shot", "lp", "clipAdapter", "tipAdapter", "tipAdapter-tuned", "tipAdapter-f",
-                  "tipAdapter-f-tuned"]
-ABLATIONS = ["ours-nocache", "ours-noattn", "ours-nores", "ours-noknow"]
+               "tipAdapter-f-tuned": "#eda100", "ours2": "#2a78d6", "lp": "#7a4fd0",
+               "tipAdapter-tuned-cv": "#1baf7a"}
+PAIRED_AGAINST = ["zero_shot", "lp", "clipAdapter", "tipAdapter", "tipAdapter-tuned", "tipAdapter-tuned-cv",
+                  "tipAdapter-f", "tipAdapter-f-tuned"]
+ABLATIONS = {"ours": ["ours-nocache", "ours-noattn", "ours-nores", "ours-noknow"],
+             "ours2": ["ours", "ours2-nocv", "ours2-nohead", "ours2-nocache", "ours2-noknow"]}
 
 
 def load(path):
@@ -146,7 +151,8 @@ def effective_shots_audit(df):
     return "\n".join(lines) + "\n"
 
 
-def plot_metric(df, metric, out_path):
+def plot_metric(df, metric, out_path, plot_methods=None):
+    plot_methods = plot_methods or PLOT_METHODS
     surf, ink, sec, mut, grid, axis = "#fcfcfb", "#0b0b0b", "#52514e", "#898781", "#e1e0d9", "#c3c2b7"
     dsets = [d for d in DATASET_NAMES if d in set(df.dataset)]
     n = len(dsets)
@@ -163,7 +169,7 @@ def plot_metric(df, metric, out_path):
             ax.axhline(zs.mean(), color=mut, lw=1.2, ls="--", zorder=1)
             ax.text(xs[0], zs.mean(), " zero-shot", color=mut, fontsize=8, va="bottom")
         ends = {}
-        for m in PLOT_METHODS:
+        for m in plot_methods:
             g = sub[sub.method == m].groupby("shots")[metric].agg(["mean", "std"]).reindex(shots)
             if g["mean"].isna().all():
                 continue
@@ -197,7 +203,7 @@ def plot_metric(df, metric, out_path):
     fig.suptitle(f"{METRIC_NAMES[metric]} vs. shots per class (mean ± std over seeds)", x=0.04, ha="left",
                  fontsize=13, color=ink)
     handles = [plt.Line2D([0], [0], color=PLOT_COLORS[m], lw=2.2, marker="o", ms=5, mec=surf, label=PRETTY[m])
-               for m in PLOT_METHODS if m in set(df.method)]
+               for m in plot_methods if m in set(df.method)]
     fig.legend(handles=handles, loc="lower center", ncol=len(handles), frameon=False, fontsize=9,
                labelcolor=sec)
     fig.tight_layout(rect=(0.01, 0.06, 0.86, 0.95))
@@ -218,18 +224,33 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--results", default="./local_data/benchmark/results.jsonl")
     p.add_argument("--out_dir", default="./local_data/benchmark/summary")
+    p.add_argument("--target", default="ours", help="method compared against the baselines: ours | ours2")
+    p.add_argument("--seeds", default="", help="optional comma list / range (a-b) of seeds to keep")
     args = p.parse_args()
     os.makedirs(args.out_dir, exist_ok=True)
     df = load(args.results)
+    if args.seeds:
+        keep = []
+        for part in args.seeds.split(","):
+            if "-" in part:
+                a, b = part.split("-"); keep += list(range(int(a), int(b) + 1))
+            else:
+                keep.append(int(part))
+        df = df[df.seed.isin(keep)]
+    target = args.target
+    plot_methods = [target, "lp", "clipAdapter", "tipAdapter-tuned-cv" if target == "ours2" else "tipAdapter-tuned",
+                    "tipAdapter-f-tuned"]
     df.to_csv(os.path.join(args.out_dir, "results_long.csv"), index=False)
     rng = np.random.default_rng(0)
 
     write_tables(df, args.out_dir)
     for metric in ["kappa", "aca"]:
-        plot_metric(df, metric, os.path.join(args.out_dir, f"{metric}_vs_shots.png"))
+        plot_metric(df, metric, os.path.join(args.out_dir, f"{metric}_vs_shots.png"), plot_methods)
 
-    paired = pd.concat([paired_stats(df, "ours", PAIRED_AGAINST, m, rng) for m in ["kappa", "aca"]] +
-                       [paired_stats(df, "ours", ABLATIONS, m, rng) for m in ["kappa", "aca"]], ignore_index=True)
+    others = [m for m in PAIRED_AGAINST if m in set(df.method)]
+    abl = [m for m in ABLATIONS.get(target, []) if m in set(df.method)]
+    paired = pd.concat([paired_stats(df, target, others, m, rng) for m in ["kappa", "aca"]] +
+                       [paired_stats(df, target, abl, m, rng) for m in ["kappa", "aca"]], ignore_index=True)
     paired.to_csv(os.path.join(args.out_dir, "paired_stats.csv"), index=False)
 
     seeds = df.seed.nunique()
@@ -237,7 +258,7 @@ def main():
               f"Runs: {len(df)}  |  datasets: {df.dataset.nunique()}  |  seeds: {seeds}  |  "
               f"methods: {df.method.nunique()}\n",
               effective_shots_audit(df),
-              "## Paired comparisons (Ours minus other; per-seed averages, 95% bootstrap CI over seeds, "
+              f"## Paired comparisons ({PRETTY[target]} minus other; per-seed averages, 95% bootstrap CI over seeds, "
               "exact sign-flip p-value)\n"]
     for metric in ["kappa", "aca"]:
         sub = paired[(paired.metric == metric) & (paired.scope == "all datasets")].drop(

@@ -33,8 +33,8 @@ from flair.modeling.misc import set_seeds
 from flair.pretraining.data.dataset import Dataset
 from flair.pretraining.data.transforms import LoadImage, ImageScaling, CopyDict
 from flair.transferability.modeling import adapters as A
-from flair.transferability.benchmark_utils import (make_split, kshot_indices, tuning_score,
-                                                   ALPHAS, BETAS, LAMBDAS)
+from flair.transferability.benchmark_utils import (make_split, kshot_indices, tuning_score, support_folds,
+                                                   ALPHAS, BETAS, LAMBDAS, LAMBDAS_HEAD)
 from flair.utils.metrics import classification_metrics
 
 from local_data.constants import PATH_DATASETS
@@ -45,7 +45,9 @@ warnings.filterwarnings("ignore")
 
 ALL_METHODS = ["zero_shot", "zero_shot_noknow", "lp", "clipAdapter", "tipAdapter", "tipAdapter-tuned",
                "tipAdapter-f", "tipAdapter-f-tuned", "ours", "ours-nocache", "ours-noattn", "ours-nores",
-               "ours-noknow"]
+               "ours-noknow",
+               # v4 ("ours2"): text-anchored head + cache, no attention, support-set CV tuning
+               "tipAdapter-tuned-cv", "ours2", "ours2-nocv", "ours2-nohead", "ours2-nocache", "ours2-noknow"]
 
 
 @contextlib.contextmanager
@@ -129,9 +131,91 @@ def tune_cache(adapter, alphas, betas):
     return {"alpha": best[1], "beta": best[2], "val_score": float(best[0])}
 
 
+_TEMPLATES = {}
+
+
+def head_template(model, targets, dk):
+    """One KnowledgeHeadAdapter per (classes, domain_knowledge): the frozen text side is computed once."""
+    key = (tuple(targets.keys()), dk)
+    if key not in _TEMPLATES:
+        with quiet():
+            _TEMPLATES[key] = A.KnowledgeHeadAdapter(model, targets, domain_knowledge=dk)
+    return _TEMPLATES[key]
+
+
+def tune_cv(build_fn, logits_fn, store, lams, alphas, betas, use_cv=True):
+    """
+    Select (lam, alpha, beta) by held-out performance. With use_cv the score is computed on the validation
+    split PLUS the support images held out in stratified folds of the k-shot support set (models trained on
+    the remaining support images); without it, on the validation split only. k = 1 has no CV folds.
+    Ties go to the first candidate in grid order. Test data is never touched.
+    """
+    Xs, Ys = store["train"]
+    Xv, Yv = store["val"]
+    folds = support_folds(Ys) if use_cv else []
+    if not folds:
+        folds = [(np.arange(len(Ys)), np.array([], dtype=int))]
+
+    best = None
+    for lam in lams:
+        acc = {}
+        for fi, (tr, ho) in enumerate(folds):
+            ad = build_fn(lam)
+            ad.train(Xs[tr], Ys[tr])
+            Xe, Ye = Xs[ho], Ys[ho]
+            if fi == 0:
+                Xe, Ye = np.concatenate([Xe, Xv]), np.concatenate([Ye, Yv])
+            Xt = torch.tensor(Xe, dtype=torch.float32, device=A.device)
+            for a in alphas:
+                for b in betas:
+                    ad.alpha, ad.beta = a, b
+                    with torch.no_grad():
+                        lg = logits_fn(ad, Xt).cpu().numpy()
+                    refs_l, lg_l = acc.setdefault((a, b), ([], []))
+                    refs_l.append(Ye)
+                    lg_l.append(lg)
+        for (a, b), (refs_l, lg_l) in acc.items():
+            sc = tuning_score(np.concatenate(refs_l), np.concatenate(lg_l))
+            if best is None or sc > best[0]:
+                best = (sc, lam, a, b)
+    return {"val_score": float(best[0]), "lam": best[1], "alpha": best[2], "beta": best[3]}
+
+
+def run_cv_method(method, model, targets, store):
+    Xte, Yte = store["test"]
+    Xs, Ys = store["train"]
+    if method == "tipAdapter-tuned-cv":
+        def build_fn(lam):
+            return build(A.TipAdapter, model, targets, store, train=False)
+        logits_fn = lambda ad, X: ad.adapter(X)
+        hp = tune_cv(build_fn, logits_fn, store, [0.0], ALPHAS, BETAS, use_cv=True)
+        ad = build_fn(0.0)
+        ad.train(Xs, Ys)
+    else:
+        dk = method != "ours2-noknow"
+        use_head = method not in ("ours2-nohead",)
+        tmpl = head_template(model, targets, dk)
+        lams = LAMBDAS_HEAD if use_head else [0.0]
+        alphas = [0] if method == "ours2-nocache" else ALPHAS
+        betas = [5] if method == "ours2-nocache" else BETAS
+        build_fn = lambda lam: tmpl.fresh(lam, use_head=use_head)
+        logits_fn = lambda ad, X: ad.logits(X)
+        hp = tune_cv(build_fn, logits_fn, store, lams, alphas, betas, use_cv=(method != "ours2-nocv"))
+        ad = build_fn(hp["lam"])
+        ad.train(Xs, Ys)
+    ad.alpha, ad.beta = hp["alpha"], hp["beta"]
+    Xt = torch.tensor(Xte, dtype=torch.float32, device=A.device)
+    with torch.no_grad():
+        lg = (ad.adapter(Xt) if method == "tipAdapter-tuned-cv" else ad.logits(Xt))
+        preds = torch.softmax(lg, dim=-1).cpu().numpy()
+    return test_metrics(Yte, preds), hp
+
+
 def run_method(method, model, targets, store, seed):
     set_seeds(1000 + seed, use_cuda=torch.cuda.is_available())
     hp = {}
+    if method == "tipAdapter-tuned-cv" or method.startswith("ours2"):
+        return run_cv_method(method, model, targets, store)
 
     if method in ("zero_shot", "zero_shot_noknow"):
         ad = build(A.ZeroShot, model, targets, store, domain_knowledge=(method == "zero_shot"))

@@ -11,6 +11,7 @@ Zero-shot, Linear Probe (LP), ClipAdapter, TipAdapter, TipAdapter-f
 """
 
 import copy
+import copy as copy_module   # not patched by the benchmark (it replaces copy.deepcopy only)
 import os
 import random
 import torch
@@ -558,6 +559,68 @@ class KnowledgeProtoAdapter(KnowledgeCacheAdapter):
         # Full-batch training on the cached support features, cache OFF (a support image would match itself).
         # lr / steps are fixed a priori; only lam (and the cache alpha/beta) are tuned, on validation data.
         optimizer = torch.optim.AdamW(params, lr=self.lr, weight_decay=0.0, eps=1e-4)
+        for _ in range(self.steps):
+            loss = torch.nn.functional.cross_entropy(self.text_logits(X), Y) + self.lam * (self.delta ** 2).sum()
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+
+class KnowledgeHeadAdapter(KnowledgeCacheAdapter):
+    """
+    Knowledge-initialised prototype head + support cache (v4, "ours2"). No description attention.
+
+        logits_c(x) = s * <x, t_c + delta_c> + alpha * Tip-cache_c(x)
+
+    t_c: FLAIR's expert-description prototype (mean of the class's expert-text embeddings), so with
+         delta = 0 and alpha = 0 the model is exactly zero-shot FLAIR.
+    delta: learnable per-class residual added to the text prototype, trained by cross-entropy on the support
+         set with an L2 anchor lam * ||delta||^2 toward the text prototype. It is multiplied by the same logit
+         scale s as the text term (v3's residual was not, so its penalty froze it at ~0). Strong anchor ->
+         zero-shot behaviour (few shots); weak anchor -> linear-probe behaviour (many shots).
+    cache: training-free Tip-style cache over the support features; alpha, beta and lam are chosen by the
+         benchmark (support-set cross-validation + validation split), never on test data.
+    use_head=False -> text prototype + cache only. fresh(lam) clones the (frozen) text side cheaply.
+    """
+
+    def __init__(self, model, targets, domain_knowledge=False, tta=False, fta=False,
+                 lam=1.0, alpha=1.0, beta=5, steps=100, lr=0.002, use_head=True):
+        super().__init__(model, targets, domain_knowledge=domain_knowledge, tta=tta, fta=fta, use_cache=True)
+        self.lam, self.alpha, self.beta = lam, alpha, beta
+        self.steps, self.lr, self.use_head = steps, lr, use_head
+        self._new_head()
+
+    def _new_head(self):
+        n_classes, _, dim = self.desc_embeds.shape
+        self.delta = torch.nn.Parameter(torch.zeros(n_classes, dim, device=device))
+        self.cache_keys, self.cache_values = None, None
+
+    def fresh(self, lam, use_head=None):
+        clone = copy_module.copy(self)          # shares the frozen model / text embeddings
+        clone.lam = lam
+        if use_head is not None:
+            clone.use_head = use_head
+        clone._new_head()
+        return clone
+
+    def text_logits(self, X):
+        out = super().text_logits(X)            # gamma = u = 0 (never trained) -> mean expert prototype
+        if self.use_head:
+            out = out + self.scale * (X @ self.delta.t())
+        return out
+
+    def train(self, X, Y):
+        X = torch.tensor(X).to(torch.float32).to(device)
+        Y = torch.tensor(Y).to(torch.long).to(device)
+
+        self.cache_keys = X.t()
+        self.cache_values = torch.nn.functional.one_hot(Y, num_classes=self.num_targets).to(torch.float32)
+
+        if not self.use_head:
+            return
+        # Full-batch training on cached support features, cache OFF (a support image would match itself).
+        # lr / steps fixed a priori; lam is selected on held-out data by the benchmark.
+        optimizer = torch.optim.AdamW([self.delta], lr=self.lr, weight_decay=0.0, eps=1e-4)
         for _ in range(self.steps):
             loss = torch.nn.functional.cross_entropy(self.text_logits(X), Y) + self.lam * (self.delta ** 2).sum()
             optimizer.zero_grad()
